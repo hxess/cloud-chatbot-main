@@ -1,399 +1,258 @@
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-
-import configparser
-import logging
-import redis
-import pymysql.cursors
 import random
+
+import mysql.connector
+from mysql.connector import errorcode
+import requests
+import json
+import time
 import os
+import datetime
+from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
 
-"""connection = pymysql.connect(host='xxx.xxx.xxx.xxx', port=端口号, user='用户名', password='密码', database='chatbot',
-                             charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)"""
+TOKEN = (os.environ['ACCESS_TOKEN'])
 
-global redis1
+config = {
+    'user': os.environ['user'],
+    'password': os.environ['pwd'],
+    'host': os.environ['sqlhost'],
+    'database': os.environ['db']
+}
 
-global flag
-global cookname
-global cookvideo
-global cookdescribe
-global movieposter
-global movieid
-global moviename
-global movieposter
-global connection
-flag = 0
+
+# Define the command names
+START_CMD = "start"
+RECOMMEND_CMD = "/recommend"
+GET_CMD = "/get"
+
+
+reply_keyboard = [
+    [KeyboardButton(RECOMMEND_CMD)],
+    [KeyboardButton(GET_CMD)]
+]
+markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+
+# Define the inline keyboard options for movie recommendation
+inline_keyboard = InlineKeyboardMarkup([
+    [InlineKeyboardButton("收藏", callback_data="fav")],
+    [InlineKeyboardButton("备选测试选项", callback_data="next")]
+])
+
+
+
+#  connect to sql
+try:
+    cnx = mysql.connector.connect(**config)
+except mysql.connector.Error as err:
+    if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+        print("Something is wrong with your user name or password")
+    elif err.errno == errorcode.ER_BAD_DB_ERROR:
+        print("Database does not exist")
+    else:
+        print(err)
+else:
+    print("MySQL connection successful")
+    cursor = cnx.cursor()
+
+def update_user_info(user_id, user_nickname):
+    now = datetime.datetime.now()
+    timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
+    query = "INSERT INTO User_info_test_1 (user_id, user_nickname, user_last_active) " \
+            "VALUES (%s, %s, %s) " \
+            "ON DUPLICATE KEY UPDATE " \
+            "user_nickname = VALUES(user_nickname), " \
+            "user_last_active = VALUES(user_last_active)"
+    values = (user_id, user_nickname, timestamp)
+    cursor.execute(query, values)
+    cnx.commit()
+
+# 从接口拿到推荐电影的数据, 随机传入page参数, 返回带有海报url的电影
+def get_upcoming_movies(page):
+    url = "https://moviesdatabase.p.rapidapi.com/titles/x/upcoming"
+
+    headers = {
+        "X-RapidAPI-Key": "4274575d4fmsh03bcb3689951fd1p1f6d31jsn91881054f5d7",
+        "X-RapidAPI-Host": "moviesdatabase.p.rapidapi.com"
+    }
+
+    response = requests.request("GET", url, headers=headers, params={'page': page})
+
+    movies = json.loads(response.text)['results']
+
+    reply = []
+
+    for movie in movies:
+        if movie['primaryImage']:
+            tmp = {}
+            tmp['id'] = movie['id']
+            tmp['poster_url'] = movie['primaryImage']['url']
+            tmp['title'] = movie['titleText']['text']
+            reply.append(tmp)
+
+    return reply
+
+# 用movie_id去查电影信息
+def get_movie_details(movie_id):
+    url = "https://moviesdatabase.p.rapidapi.com/titles/x/titles-by-ids"
+
+    querystring = {"idsList": movie_id}
+
+    headers = {
+        "X-RapidAPI-Key": "4274575d4fmsh03bcb3689951fd1p1f6d31jsn91881054f5d7",
+        "X-RapidAPI-Host": "moviesdatabase.p.rapidapi.com"
+    }
+
+    response = requests.request("GET", url, headers=headers, params=querystring)
+
+    movie = json.loads(response.text)['results'][0]
+
+    tmp = {}
+    tmp['id'] = movie['id']
+    tmp['title'] = movie['titleText']['text']
+    tmp['poster_url'] = movie['primaryImage']['url']
+
+    return tmp
+
+def start(update, context):
+    user_id = update.message.from_user.id
+    user_nickname = update.message.from_user.username
+    update_user_info(user_id, user_nickname)
+    message = "欢迎使用电影推荐机器人！\n" \
+              "您可以使用以下命令：\n" \
+              "/recommend - 随机推荐一部即将上映的电影\n /get - 随机获取一部您收藏的电影\n"
+    context.bot.send_message(chat_id=user_id, text=message, reply_markup=markup)
+
+
+# movies = [
+#     {"id": 123, "title": "title", "director": "director", "cast": "cast", "duration": "duration", "poster_url": "https://maimaidx-eng.com/maimai-mobile/img/chara_01.png"},
+#     {"id": 456, "title": "title2", "director": "director2", "cast": "cast2", "duration": "duration2",
+#      "poster_url": "https://maimaidx-eng.com/maimai-mobile/img/btn_page_top.png"},
+# ]
+
+def recommend(update, context):
+    message = "以下是即将上映的电影：\n\n"
+    movies = get_upcoming_movies(random.choice([1, 2, 3, 4]))
+    # index = context.user_data['last_viewed']
+    print(movies)
+    movie = random.choice(movies)
+
+    # print(movie)
+    movie_id = movie["id"]
+    movie_title = movie["title"]
+    # movie_director = movie["director"]
+    # movie_cast = movie["cast"]
+    # movie_duration = movie["duration"]
+    movie_poster_url = movie["poster_url"]
+
+    message += "<b>" + movie_title + "</b>\n"
+
+    context.user_data[movie_id] = {
+        "title": movie_title,
+        "poster_url": movie_poster_url
+    }
+    context.user_data['recommended'] = movie_id
+
+    # context.user_data['last_viewed'] =
+
+    context.bot.send_photo(chat_id=update.effective_chat.id, photo=movie_poster_url, caption=message, parse_mode="HTML", reply_markup=inline_keyboard)
+
+# 用户点击按钮的回调函数
+def button_callback(update, context):
+
+    # get query params
+    query = update.callback_query
+    user_id = query.from_user.id
+    message_id = query.message.message_id
+    query_data = query.data
+
+    if query_data == "fav":
+        # print(context)
+        movie_id = context.user_data['recommended']
+        #
+        # print(movie_id)
+        sql_query = "INSERT INTO User_favorite_test_1 (user_id, movie_id) " \
+                "VALUES (%s, %s) " \
+                "ON DUPLICATE KEY UPDATE user_id = user_id"
+        values = (user_id, movie_id)
+        cursor.execute(sql_query, values)
+        cnx.commit()
+
+        context.bot.answer_callback_query(
+            query.id,
+            text="电影已收藏！")
+    #
+    # elif query_data == "next":
+    #     movies = context.user_data["last_recommendation_movies"]
+    #     current_index = movies.index(context.user_data["current_movie"])
+    #     if current_index == len(movies) - 1:
+    #         context.bot.answer_callback_query(query.id, text="已经到达最后一部电影！")
+    #     else:
+    #         movie = movies[current_index + 1]
+    #         movie_id = movie["id"]
+    #         movie_title = movie["title"]
+    #         movie_director = movie["director"]
+    #         movie_cast = movie["cast"]
+    #         movie_duration = movie["duration"]
+    #         movie_poster_url = movie["poster_url"]
+    #         message = "<b>" + movie_title + "</b>\n" \
+    #                   "导演：" + movie_director + "\n" \
+    #                   "演员：" + movie_cast + "\n" \
+    #                   "时长：" + str(movie_duration) + "分钟\n"
+    #         context.user_data[movie_id] = {
+    #             "title": movie_title,
+    #             "director": movie_director,
+    #             "cast": movie_cast,
+    #             "duration": movie_duration,
+    #             "poster_url": movie_poster_url
+    #         }
+    #         context.user_data["current_movie"] = movie_id
+    #         context.bot.edit_message_media(chat_id=user_id, message_id=message_id, media=InputMediaPhoto(media=movie_poster_url, caption=message, parse_mode="HTML"), reply_markup=inline_keyboard)
+    #         context.bot.answer_callback_query(query.id)
+    else:
+        context.bot.answer_callback_query(
+            query.id,
+            text='备选按钮'
+        )
+
+# 从用户收藏的电影中随机返回一个
+def get(update, context):
+    user_id = update.effective_user.id
+    query = "SELECT movie_id FROM User_favorite_test_1 WHERE user_id = %s ORDER BY RAND() LIMIT 3"
+    values = (user_id,)
+    cursor.execute(query, values)
+    result = cursor.fetchall()
+    if not result:
+        context.bot.send_message(chat_id=user_id, text="您还没有收藏任何电影！")
+    else:
+        message = "以下是您的推荐电影：\n\n"
+        row = random.choice(result)
+        movie_id = row[0]
+        movie = get_movie_details(movie_id)
+        if movie:
+            movie_title = movie["title"]
+            movie_poster_url = movie["poster_url"]
+            message += "<b>" + movie_title + "</b>\n"
+            context.user_data["current_movie"] = movie_id
+        context.bot.send_photo(chat_id=user_id, photo=movie_poster_url, caption=message, parse_mode="HTML"
+                               # , reply_markup=inline_keyboard
+                               )
 
 
 def main():
-    # Load your token and create an Updater for your Bot
-
-    config = configparser.ConfigParser()
-    config.read('config.ini')
-    updater = Updater(token=(config['TELEGRAM']['ACCESS_TOKEN']), use_context=True)
+    updater = Updater(token=TOKEN, use_context=True)
     dispatcher = updater.dispatcher
 
-    global redis1
-    redis1 = redis.Redis(host=(config['REDIS']['HOST']), password=(config['REDIS']['PASSWORD']),
-                         port=(config['REDIS']['REDISPORT']))
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("help", help))
+    dispatcher.add_handler(CommandHandler("recommend", recommend))
+    dispatcher.add_handler(CommandHandler("get", get))
 
-    global connection
-    connection = pymysql.connect(host=(config['mysql']['HOST']), port=int((config['mysql']['PORT'])),
-                                 user=(config['mysql']['USER']), password=(config['mysql']['PASSWORD']),
-                                 database=(config['mysql']['DATABASE']))
+    dispatcher.add_handler(CallbackQueryHandler(button_callback))
 
-
-
-    # You can set this logging module, so you will know when and why things do not work as expected
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        level=logging.INFO)
-    # register a dispatcher to handle message: here we register an echo dispatcher
-    echo_handlerp = MessageHandler(Filters.photo, echophoto)
-    # echo_handlerl = MessageHandler(Filters.photo & Filters.text, upload)
-    echo_handlert = MessageHandler(Filters.text & (~Filters.command), echo)
-    echo_handlerv = MessageHandler(Filters.video, echovideo)
-    # echo_handler = MessageHandler(Filters.photo & (~Filters.command), echo)
-    dispatcher.add_handler(echo_handlerp)
-    dispatcher.add_handler(echo_handlert)
-    dispatcher.add_handler(echo_handlerv)
-    # dispatcher.add_handler(echo_handlerl)
-    # on different commands - answer in Telegram
-    dispatcher.add_handler(CommandHandler("add", add))
-    dispatcher.add_handler(CommandHandler("help", help_command))
-    dispatcher.add_handler(CommandHandler("who", who))
-    dispatcher.add_handler(CommandHandler("upload", upload))
-    dispatcher.add_handler(CommandHandler("cname", uploadcname))
-    dispatcher.add_handler(CommandHandler("cdescribe", uploaddescribe))
-    dispatcher.add_handler(CommandHandler("cook", cookreply))
-    dispatcher.add_handler(CommandHandler("find", findmovie))
-    dispatcher.add_handler(CommandHandler("write", mwrite))
-    dispatcher.add_handler(CommandHandler("read", mread))
-    dispatcher.add_handler(CommandHandler("createm", addmovie))
-    dispatcher.add_handler(CommandHandler("start", guid))
-    dispatcher.add_handler(CommandHandler("guidance", guid))
-    dispatcher.add_handler(CommandHandler("listc", listcook))
-    dispatcher.add_handler(CommandHandler("listm", listmovie))
-
-
-    # To start the bot:
+    # Start the bot
     updater.start_polling()
+
     updater.idle()
-
-
-def setdefualt():
-    global cooknames
-    global cookvideo
-    global cookdescribe
-    global movieposter
-    global moviename
-    cookvideo = ''
-    cookdescribe = ''
-    cooknames = ''
-    moviename = ''
-    movieposter = ''
-
-
-
-def guid(update, context):
-    update.message.reply_text('Welcome to team25 chatbot')
-    update.message.reply_text('/find + movie name : to view or write the comment of movie ')
-    update.message.reply_text('/listm  : to browse the list of movies (random select 4 each time)')
-    update.message.reply_text('/createm + movie name : to add a new movie ')
-    update.message.reply_text('/cook + food name : to find the cooking video')
-    update.message.reply_text('/listc  : to browse the list of cooking videos (random select 4 each time)')
-    update.message.reply_text('/upload : to start upload your cooking video ')
-    update.message.reply_text('/guidance : to view guidance again ')
-
-
-def listcook(update, context):
-    reply=listcooksql()
-    if len(reply) < 4:
-        rsample = range(len(reply))
-    else:
-        rsample = (random.sample(range(1, len(reply)), 4))
-    for i in rsample:
-        update.message.reply_text('food name: \n' + reply[i][1])
-
-def listcooksql():
-    cursor = connection.cursor()
-    try:
-        sql = 'select * from cook;'
-        cursor.execute(sql)
-        result = cursor.fetchall()
-        return (result)
-    except:
-        Exception: print("Fail")
-    cursor.close()
-
-
-def listmovie(update, context):
-    reply=listmoviesql()
-    print(len(reply))
-    if len(reply) <=4:
-        rsample = range(len(reply))
-    else:
-        rsample = (random.sample(range(1, len(reply)), 4))
-    for i in rsample:
-        update.message.reply_text('movie name: \n' + reply[i][1])
-        update.message.reply_photo(reply[i][2])
-
-def listmoviesql():
-    cursor = connection.cursor()
-    try:
-        sql = 'select * from movie;'
-        cursor.execute(sql)
-        result = cursor.fetchall()
-        return (result)
-    except:
-        Exception: print("Fail")
-    cursor.close()
-
-
-def uploadcname(update, context):
-    global flag
-    if flag == 0:
-        update.message.reply_text('you have not started upload cook function yet')
-    elif flag == 1:
-        cname = update.message.text[7:]
-        global cookname
-        cookname = cname
-        update.message.reply_text('discribe your dish, using the function /cdescribe')
-
-
-def uploaddescribe(update, context):
-    global flag
-    if flag == 0:
-        update.message.reply_text('you have not started upload cook function yet')
-    elif flag == 1:
-        cd = update.message.text[11:]
-        global cookdescribe
-        cookdescribe = cd
-        update.message.reply_text('now send your cooking video directly(size limitation is 20MB)')
-
-
-def upload(update: Update, context: CallbackContext):  # start teh function to upload cookvideo
-    global flag
-    flag = 1
-    update.message.reply_text('Tell me the name of your dish, using the function /cname')
-
-
-def echophoto(update, context: CallbackContext):
-    file = update.message.photo[-1]
-    logging.info(context.args)
-    logging.info(context)
-    global flag
-    global a
-    if flag == 2:
-        global moviename
-        minsert(moviename, file.file_id)
-        print(a)
-        if a==1:
-            update.message.reply_text('upload successfully')
-        else:
-            update.message.reply_text('please provide a poster with better quality')
-        flag = 0
-    elif flag == 0:
-        update.message.reply_photo(file)
-
-
-def echovideo(update, context):
-    file = update.message.video
-    logging.info(file.get_file())
-    logging.info(file.file_id)
-    global flag
-    global cookvideo
-    if flag == 1:  # means the following video will be uploaded
-        cookvideo = file.file_id
-        flag = 0
-        uploadcook()
-        update.message.reply_text('upload successfully')
-    elif flag == 0:
-        context.bot.send_video(chat_id=update.effective_chat.id, video=file.file_id)
-
-
-def uploadcook():
-    global cookname
-    global cookvideo
-    global cookdescribe
-    try:
-        cursor = connection.cursor()
-        sql = 'insert into cook values(0,%s,%s,%s);'
-        cursor.execute(sql, [cookname, cookvideo, cookdescribe])
-        cursor.fetchall()
-        connection.commit()
-        setdefualt()
-    except:
-        Exception: print("Fail")
-    cursor.close()
-
-
-def cookreply(update: Update, context: CallbackContext):  # reply the information of cook to user
-    cname = update.message.text[6:]
-    logging.info(cname)
-    reply = getvideo(cname)
-    logging.info(reply[2])
-    update.message.reply_text('NAME: ' + reply[1])
-    update.message.reply_text('DESCRIBE: ' + reply[3])
-    update.message.reply_video(reply[2])
-
-
-def getvideo(cname):  # get cook video from sql
-    cursor = connection.cursor()
-    try:
-        sql = "select* from cook where cookname=%s"
-        cursor.execute(sql, [cname])
-        result = cursor.fetchall()
-        data = result[0]
-        return (data)
-
-    except:
-        Exception: print('fail')
-    cursor.close()
-
-
-def findmovie(update: Update, context: CallbackContext):
-    global movieid
-    mname = update.message.text[6:]
-    result = movieinsql(mname)
-    if result:
-        movieid = result[0][0]
-        update.message.reply_text(
-            'If you want to write comment, please use function /write + your comment\nIf you want to read comment, please use function /read')
-
-    else:
-        update.message.reply_text(
-            'No such movie in database, you can create a new one, by using function /createm + movie name')
-
-
-def movieinsql(mname):
-    cursor = connection.cursor()
-    try:
-        sql = "select * from movie where m_name=%s"
-        cursor.execute(sql, [mname])
-        result = cursor.fetchall()
-        return (result)
-    except:
-        Exception: print('fail')
-    cursor.close()
-
-
-def mwrite(update, context):
-    global movieid
-    comment = update.message.text[7:]
-    cinsert(movieid, comment)
-    update.message.reply_text('comment finish')
-
-
-def cinsert(id, comment):
-    cursor = connection.cursor()
-    try:
-        sql = 'insert into comment values(0,%s,%s);'
-        cursor.execute(sql, [comment, id])
-        connection.commit()
-    except:
-        Exception: print("Fail")
-    cursor.close()
-
-
-def mread(update: Update, context: CallbackContext):
-    global movieid
-    logging.info(movieid)
-    reply = getcomment(movieid)
-    reply2 = getposter(movieid)
-    if len(reply) < 4:
-        rsample = range(len(reply))
-    else:
-        rsample = (random.sample(range(1, len(reply)), 4))
-    update.message.reply_photo(reply2[0][2])
-    for i in rsample:
-        update.message.reply_text('Comment: \n' + reply[i][1])
-
-    setdefualt()
-
-
-def getposter(id):
-    cursor = connection.cursor()
-    try:
-        sql = 'select * from movie where mid=%s;'
-        cursor.execute(sql, id)
-        result = cursor.fetchall()
-        return (result)
-    except:
-        Exception: print("Fail")
-    cursor.close()
-
-
-def getcomment(id):
-    cursor = connection.cursor()
-    try:
-        sql = 'select * from comment where mid=%s;'
-        cursor.execute(sql, id)
-        result = cursor.fetchall()
-        return (result)
-    except:
-        Exception: print("Fail")
-    cursor.close()
-
-
-def addmovie(update: Update, context: CallbackContext):
-    global flag
-    global moviename
-    moviename = update.message.text[9:]
-    if movieinsql(moviename):
-        update.message.reply_text('this movie already existed, please use /find +movie name to view or read the comment')
-    else:
-        flag = 2
-        update.message.reply_text('please provide a poster for this movie')
-        update.message.reply_text(
-            'If there is no successful upload notification, please attempt upload a better quality poster')
-
-
-def minsert(name, poster):
-    global a
-    a=0
-    cursor = connection.cursor()
-    try:
-        sql = 'insert into movie values(0,%s,%s);'
-        cursor.execute(sql, [name, poster])
-        connection.commit()
-        a=1
-    except:
-        Exception: print("Fail")
-    cursor.close()
-    setdefualt()
-
-
-def echo(update, context):
-    reply_message = update.message.text.upper()
-    logging.info("Update: " + str(update))
-    logging.info("context: " + str(context))
-    context.bot.send_message(chat_id=update.effective_chat.id, text=reply_message)
-
-
-# Define a few command handlers. These usually take the two arguments update and
-# context. Error handlers also receive the raised TelegramError object in error.
-def help_command(update: Update, context: CallbackContext) -> None:
-    """Send a message when the command /help is issued."""
-    update.message.reply_text('Helping you helping you.')
-
-
-def add(update: Update, context: CallbackContext) -> None:
-    """Send a message when the command /add is issued."""
-    try:
-        global redis1
-        logging.info(context.args)
-        logging.info(context.args[0])
-        msg = context.args[0]  # /add keyword <-- this should store the keyword
-        redis1.incr(msg)
-        update.message.reply_text('You have said ' + msg + ' for ' + redis1.get(msg).decode('UTF-8') + ' times.')
-    except (IndexError, ValueError):
-        update.message.reply_text('Usage: /add <keyword>')
-
-
-def who(update: Update, context: CallbackContext) -> None:
-    """Send a message when the command /hello is issued."""
-    update.message.reply_text('I am project chatbot!')
-
 
 if __name__ == '__main__':
     main()

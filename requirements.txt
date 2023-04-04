@@ -1,5 +1,8 @@
 telegram
 configparser
-pymysql
-python-telegram-bot>=13.1
 redis
+python-telegram-bot==13.7
+steamship
+requests
+openai
+mysql-connector-python
