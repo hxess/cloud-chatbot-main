@@ -250,7 +250,7 @@ def ask(update: Update, msg: CallbackContext) -> None:
     # data = {"model": "gpt-3.5-turbo", "messages": user_conversations[user_id]['history']}
     if len(good_key) < 1:
         update.message.reply_text('Oops! we encountered a problem with GPT key, maybe try me later.')
-    openai.api_key = good_key[0]
+    openai.api_key = good_key[-1]
     # openAi python sdk
     result = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
