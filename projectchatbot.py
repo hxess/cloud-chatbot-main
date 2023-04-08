@@ -1,52 +1,19 @@
-import random
-import logging
+import random, requests, openai, threading, logging, os, re, datetime
 import mysql.connector
+
 from mysql.connector import errorcode
-import requests
-import json
-import os
-import datetime
-from telegram import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, CallbackContext
-import openai
-from datetime import datetime, timedelta
+from datetime import timedelta, datetime
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
-import threading
 
-# local vars for GPT
-user_conversations = {}
-good_key = []
-
-# config vars
-TOKEN = (os.environ['ACCESS_TOKEN'])
-
+## sql connector
 config = {
     'user': os.environ['user'],
     'password': os.environ['pwd'],
     'host': os.environ['sqlhost'],
     'database': os.environ['db']
 }
-
-
-# Define the command names
-START_CMD = "start"
-RECOMMEND_CMD = "/recommend"
-GET_CMD = "/get"
-
-
-reply_keyboard = [
-    [KeyboardButton(RECOMMEND_CMD)],
-    [KeyboardButton(GET_CMD)]
-]
-markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
-
-# Define the inline keyboard options for movie recommendation
-inline_keyboard = InlineKeyboardMarkup([
-    [InlineKeyboardButton("收藏", callback_data="fav")],
-    [InlineKeyboardButton("备选测试选项", callback_data="next")]
-])
-
-#  connect to sql
 try:
     cnx = mysql.connector.connect(**config)
 except mysql.connector.Error as err:
@@ -60,8 +27,132 @@ else:
     print("MySQL connection successful")
     cursor = cnx.cursor()
 
-def update_user_info(user_id, user_nickname):
-    now = datetime.datetime.now()
+
+# handle functions
+def error(update, context):
+    logging.warning('Update "%s" caused error "%s"', update, context.error)
+
+def start(update, context):
+    user_id = update.message.from_user.id
+    user_nickname = update.message.from_user.username
+    sql_update_user_info(user_id, user_nickname)
+
+    reply_keyboard = [
+        [KeyboardButton('start')],
+        [KeyboardButton('/genres')],
+        [KeyboardButton('/get')],
+        [KeyboardButton('/ask')],
+    ]
+    markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+
+    message = "Welcome to the movie recommendation chatbot.！\n" \
+              "You can use the following commands：\n" \
+              "/genres - display the genres entrance\n " \
+              "/get - Randomly pick one of your favorite movies.\n" \
+              "/ask - ask GPT assistant to help you to pick a movie from your favorites."
+
+    context.bot.send_message(chat_id=user_id, text=message, reply_markup=markup)
+
+## movie functions
+# function to handle /start command
+def genres(update, context):
+    keyboard = [[InlineKeyboardButton("Action",
+                                      # callback_data=str({"with": "action", "without": "Comedy|Drama|Horror"})
+                                      callback_data='action'
+                                      ),
+                 InlineKeyboardButton("Comedy",
+                                      # callback_data=str({"with": "Comedy", "without": "Action|Drama|Horror"})
+                                      callback_data='comedy'
+                                      )],
+                [InlineKeyboardButton("Drama",
+                                      # callback_data=str({"with": "Drama", "without": "Comedy|Action|Horror"})
+                                      callback_data='drama'
+                                      ),
+                 InlineKeyboardButton("Horror",
+                                      # callback_data=str({"with": "Horror", "without": "Comedy|Drama|Action"})
+                                      callback_data='horror'
+                                      )]]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text('Please choose a genre:', reply_markup=reply_markup)
+
+# function to handle button click
+def button(update, context):
+    query = update.callback_query
+
+    # genre = json.loads(query.data)['with']
+    genre = query.data
+    # without = json.loads(query.data)['without']
+    without = ['action', 'drama', 'horror', 'comedy']
+    without_genres = ''
+    for ele in without:
+        if ele == genre:
+            continue
+        else:
+            without_genres += ele
+
+
+    page = random.choice([i for i in range(1, 51)])
+
+    response = requests.get(f'https://api.themoviedb.org/3/discover/movie?api_key=bfa1c4b7acab32a4eb75aa244f15754f&with_genres={genre}&page={page}&without_genres={without_genres}')
+
+    movies = response.json()['results']
+
+    buttons = [InlineKeyboardButton(movie['title'], callback_data=movie['id']) for movie in movies]
+
+    # reply_markup = InlineKeyboardMarkup([buttons])
+    reply_markup = InlineKeyboardMarkup([[button] for button in buttons])
+
+    query.message.reply_text('Please choose a movie:', reply_markup=reply_markup)
+
+# function to handle movie button click
+def movie_button(update, context):
+    query = update.callback_query
+    movie_id = query.data
+
+    response = requests.get(f'https://api.themoviedb.org/3/movie/{movie_id}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
+
+    title = response.json()['title']
+    duration = response.json()['runtime']
+    director = response.json()['credits']['crew'][0]['name']
+    cast = [actor['name'] for actor in response.json()['credits']['cast']]
+    poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
+
+    message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> {', '.join(cast)}"
+
+    keyboard = [
+                # [InlineKeyboardButton(director, callback_data=f'director_{director}')],
+                [InlineKeyboardButton("Add to favorite", callback_data=f'fav_{movie_id}')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # send message with movie poster
+    query.message.reply_photo(photo=poster_url, caption=message, parse_mode="HTML", reply_markup=reply_markup)
+
+def director_query(update, context):
+    query = update.callback_query
+    director = query.data.split('_')[1]
+
+    response = requests.get(f'https://api.themoviedb.org/3/search/person?api_key=bfa1c4b7acab32a4eb75aa244f15754f&query={director}')
+
+    director_id = response.json()['results'][0]['id']
+    name = response.json()['results'][0]['name']
+    bio = response.json()['results'][0]['biography']
+    profile_url = f"https://image.tmdb.org/t/p/w500{response.json()['results'][0]['profile_path']}"
+
+    # send message with director details
+    message = f"<b>Name:</b> {name}\n<b>Biography:</b> {bio}"
+
+    keyboard = [[InlineKeyboardButton("Top 3 Movies", callback_data=f'top_movies_{director_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # send message with director profile picture
+    query.message.reply_photo(photo=profile_url, caption=message, parse_mode="HTML", reply_markup=reply_markup)
+
+
+## User profile management
+def sql_update_user_info(user_id, user_nickname):
+    now = datetime.now()
     timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
     query = "INSERT INTO User_info_test_1 (user_id, user_nickname, user_last_active) " \
             "VALUES (%s, %s, %s) " \
@@ -72,195 +163,58 @@ def update_user_info(user_id, user_nickname):
     cursor.execute(query, values)
     cnx.commit()
 
-# 从接口拿到推荐电影的数据, 随机传入page参数, 返回带有海报url的电影
-def get_upcoming_movies(page):
-    url = "https://moviesdatabase.p.rapidapi.com/titles/x/upcoming"
-
-    headers = {
-        "X-RapidAPI-Key": "4274575d4fmsh03bcb3689951fd1p1f6d31jsn91881054f5d7",
-        "X-RapidAPI-Host": "moviesdatabase.p.rapidapi.com"
-    }
-
-    response = requests.request("GET", url, headers=headers, params={'page': page})
-
-    movies = json.loads(response.text)['results']
-
-    reply = []
-
-    for movie in movies:
-        if movie['primaryImage']:
-            tmp = {}
-            tmp['id'] = movie['id']
-            tmp['poster_url'] = movie['primaryImage']['url']
-            tmp['title'] = movie['titleText']['text']
-            reply.append(tmp)
-
-    return reply
-
-# 用movie_id去查电影信息
-def get_movie_details(movie_id):
-    url = "https://moviesdatabase.p.rapidapi.com/titles/x/titles-by-ids"
-
-    querystring = {"idsList": movie_id}
-
-    headers = {
-        "X-RapidAPI-Key": "4274575d4fmsh03bcb3689951fd1p1f6d31jsn91881054f5d7",
-        "X-RapidAPI-Host": "moviesdatabase.p.rapidapi.com"
-    }
-
-    response = requests.request("GET", url, headers=headers, params=querystring)
-
-    movie = json.loads(response.text)['results'][0]
-
-    tmp = {}
-    tmp['id'] = movie['id']
-    tmp['title'] = movie['titleText']['text']
-    tmp['poster_url'] = movie['primaryImage']['url']
-
-    return tmp
-
-def start(update, context):
-    user_id = update.message.from_user.id
-    user_nickname = update.message.from_user.username
-    update_user_info(user_id, user_nickname)
-    message = "欢迎使用电影推荐机器人！\n" \
-              "您可以使用以下命令：\n" \
-              "/recommend - 随机推荐一部即将上映的电影\n /get - 随机获取一部您收藏的电影\n"
-    context.bot.send_message(chat_id=user_id, text=message, reply_markup=markup)
-
-# movies = [
-#     {"id": 123, "title": "title", "director": "director", "cast": "cast", "duration": "duration", "poster_url": "https://maimaidx-eng.com/maimai-mobile/img/chara_01.png"},
-#     {"id": 456, "title": "title2", "director": "director2", "cast": "cast2", "duration": "duration2",
-#      "poster_url": "https://maimaidx-eng.com/maimai-mobile/img/btn_page_top.png"},
-# ]
-
-def recommend(update, context):
-    message = "以下是即将上映的电影：\n\n"
-    movies = get_upcoming_movies(random.choice([1, 2, 3, 4]))
-    # index = context.user_data['last_viewed']
-    print(movies)
-    movie = random.choice(movies)
-
-    # print(movie)
-    movie_id = movie["id"]
-    movie_title = movie["title"]
-    movie_poster_url = movie["poster_url"]
-
-    message += "<b>" + movie_title + "</b>\n"
-
-    context.user_data[movie_id] = {
-        "title": movie_title,
-        "poster_url": movie_poster_url
-    }
-    context.user_data['recommended'] = movie_id
-
-    context.bot.send_photo(chat_id=update.effective_chat.id, photo=movie_poster_url, caption=message, parse_mode="HTML", reply_markup=inline_keyboard)
-
-# 用户点击按钮的回调函数
-def button_callback(update, context):
-
-    # get query params
-    query = update.callback_query
-    user_id = query.from_user.id
-    message_id = query.message.message_id
-    query_data = query.data
-
-    if query_data == "fav":
-        # print(context)
-        movie_id = context.user_data['recommended']
-        #
-        # print(movie_id)
-        sql_query = "INSERT INTO User_favorite_test_1 (user_id, movie_id) " \
+def sql_add_user_fav(user_id, movie_id):
+    sql_query = "INSERT INTO User_favorite_test_1 (user_id, movie_id) " \
                 "VALUES (%s, %s) " \
                 "ON DUPLICATE KEY UPDATE user_id = user_id"
-        values = (user_id, movie_id)
-        cursor.execute(sql_query, values)
-        cnx.commit()
+    values = (user_id, movie_id)
+    cursor.execute(sql_query, values)
+    cnx.commit()
 
-        context.bot.answer_callback_query(
-            query.id,
-            text="电影已收藏！")
-    # else:
-    #     context.bot.answer_callback_query(
-    #         query.id,
-    #         text='备选按钮'
-    #     )
-
-# 从用户收藏的电影中随机返回一个
-def get(update, context):
-    user_id = update.effective_user.id
+def sql_get_user_fav(user_id):
     query = "SELECT movie_id FROM User_favorite_test_1 WHERE user_id = %s ORDER BY RAND() LIMIT 3"
     values = (user_id,)
     cursor.execute(query, values)
     result = cursor.fetchall()
-    if not result:
-        context.bot.send_message(chat_id=user_id, text="您还没有收藏任何电影！")
+    return result
+
+def add_to_fav(update, context):
+    query = update.callback_query
+    movie_id = query.data.split('_')[1]
+    print(movie_id)
+    sql_add_user_fav(update.effective_user.id, movie_id)
+    query.message.reply_text("added to favorite successfully")
+
+def get_from_fav(update, context):
+    query = update.callback_query
+
+    results = sql_get_user_fav(update.effective_user.id)
+
+    if not results:
+        context.bot.send_message(chat_id=update.effective_user.id, text="You haven't favorited any movies yet.")
+
     else:
-        message = "以下是您的推荐电影：\n\n"
-        row = random.choice(result)
-        movie_id = row[0]
-        movie = get_movie_details(movie_id)
-        if movie:
-            movie_title = movie["title"]
-            movie_poster_url = movie["poster_url"]
-            message += "<b>" + movie_title + "</b>\n"
-            context.user_data["current_movie"] = movie_id
-        context.bot.send_photo(chat_id=user_id, photo=movie_poster_url, caption=message, parse_mode="HTML"
-                               # , reply_markup=inline_keyboard
-                               )
+        result = random.choice(results)[0]
+        print("bingo" + str(result))
 
-# GPT
-def ask(update: Update, msg: CallbackContext) -> None:
-    if len(msg.args) < 1:
-        update.message.reply_text("你好像没有输入问题内容捏, 示例: /ask 能不能给我喵一个？")
-        return
-    query = ''
-    for ele in msg.args:
-        query += ele
+        # get movie details from API based on selected movie id
+        response = requests.get(
+            f'https://api.themoviedb.org/3/movie/{result}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
 
-    user_id = update.effective_chat.id
-    user_message = query
-    logging.info("user Id: " + str(user_id) + " User Ask: " + user_message)
+        title = response.json()['title']
+        duration = response.json()['runtime']
+        director = response.json()['credits']['crew'][0]['name']
+        cast = [actor['name'] for actor in response.json()['credits']['cast']]
+        poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
 
-    initial_prompt = """
-        Now you are a assistant.
-    """
-    global user_conversations
+        message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> {', '.join(cast)}"
+        context.bot.send_photo(chat_id=update.effective_user.id, photo=poster_url, caption=message, parse_mode="HTML")
 
-    if user_id not in user_conversations:
-        user_conversations[user_id] = {
-            'history': [{"role": "system", "content": initial_prompt},
-                        ],
-            'expiration': datetime.now() + timedelta(minutes=10)
-        }
 
-    if user_id in user_conversations and datetime.now() > user_conversations[user_id]['expiration']:
-        del user_conversations[user_id]
-        user_conversations[user_id] = {
-            'history': [{"role": "system", "content": initial_prompt},
-                        ],
-            'expiration': datetime.now() + timedelta(minutes=10)
-        }
-
-    # If the conversation history is still valid, send the user's message to the API
-    user_conversations[user_id]['history'].append({'role': 'user', 'content': user_message})
-
-    # url = "https://chatgpt-api.shn.hk/v1/"
-    # headers = {"Content-Type": "application/json", "User-Agent": "PostmanRuntime/7.31.3"}
-    # data = {"model": "gpt-3.5-turbo", "messages": user_conversations[user_id]['history']}
-    if len(good_key) < 1:
-        update.message.reply_text('Oops! we encountered a problem with GPT key, maybe try me later.')
-    openai.api_key = good_key[0]
-    # openAi python sdk
-    result = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=user_conversations[user_id]['history']
-    )
-
-    reply = result['choices'][0]['message']['content']
-    user_conversations[user_id]['history'].append({'role': 'assistant', 'content': reply})
-    logging.info("GPT: " + reply)
-    update.message.reply_text(reply)
+## GPT features
+# local vars for GPT
+user_conversations = {}
+good_key = []
 
 def find_a_working_key():
     global good_key
@@ -284,49 +238,116 @@ def find_a_working_key():
                 presence_penalty=0
             )
             good_key.append(key[:-1])
-            logging.info('find a good key! ' + key[:-1])
+            print('find a good key! ' + key[:-1])
         except Exception as e:
             continue
 
-# 重置历史对话
-def reset(update: Update, msg: CallbackContext):
-    global user_conversations
-    user_id = update.effective_chat.id
-    reply = ""
-    if user_id in user_conversations:
-        del user_conversations[user_id]
-        reply = "已经重置了历史对话, 开启新一轮对话吧!"
+    print('done finding keys')
+def ask_neko_of_movies(update, context):
+    query = update.callback_query
+
+    context.bot.send_message(chat_id=update.effective_user.id, text="Working hard to select a movie for you, please wait...")
+
+    results = sql_get_user_fav(update.effective_user.id)
+
+    ids = []
+    text = []
+
+    if not results:
+        context.bot.send_message(chat_id=update.effective_user.id, text="You haven't favorited any movies yet！")
+
     else:
-        reply = "似乎没有历史对话捏, 无需重置"
+        # context.bot.send_photo(chat_id=update.effective_user.id, photo=poster_url, caption=message, parse_mode="HTML")
+        for ele in results:
+            ids.append(ele[0])
+        for id in ids:
+            # get movie details from API based on selected movie id
+            response = requests.get(
+                f'https://api.themoviedb.org/3/movie/{id}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
+            title = response.json()['title']
+            duration = response.json()['runtime']
+            overview = response.json()['overview']
+            director = response.json()['credits']['crew'][0]['name']
+            cast = [actor['name'] for actor in response.json()['credits']['cast']]
+            poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
 
-    update.message.reply_text(reply)
+            message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> Overview:</b> {overview} "
+            text.append(message)
 
+        if len(text) > 10:
+            text = random.sample(text, 10)
+
+        prompt = "Please select a movie form the next information I provided, you need to look into the duration and overview of them\n "
+        for ele in text:
+            prompt += ele
+
+        user_id = update.effective_chat.id
+
+        initial_prompt = """
+                Now you are a assistant.
+            """
+
+        if user_id not in user_conversations:
+            user_conversations[user_id] = {
+                'history': [{"role": "system", "content": initial_prompt},
+                            ],
+                'expiration': datetime.now() + timedelta(minutes=10)
+            }
+
+        if user_id in user_conversations and datetime.now() > user_conversations[user_id]['expiration']:
+            del user_conversations[user_id]
+            user_conversations[user_id] = {
+                'history': [{"role": "system", "content": initial_prompt},
+                            ],
+                'expiration': datetime.now() + timedelta(minutes=10)
+            }
+
+        user_conversations[user_id]['history'].append({'role': 'user', 'content': prompt})
+
+        # if len(good_key) < 1:
+        #     context.bot.send_message(chat_id=update.effective_user.id, text='Oops! we encountered a problem with GPT key, maybe try me later.')
+        openai.api_key = good_key[-1]
+
+        # openAi python sdk
+        result = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=user_conversations[user_id]['history']
+        )
+
+        reply = result['choices'][0]['message']['content']
+        user_conversations[user_id]['history'].append({'role': 'assistant', 'content': reply})
+        logging.info("GPT: " + reply)
+        # update.message.reply_text(reply)
+        context.bot.send_message(text=reply, chat_id=update.effective_user.id)
 
 def main():
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-    updater = Updater(token=TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
+    updater = Updater(os.environ['ACCESS_TOKEN'], use_context=True)
 
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("help", help))
-    dispatcher.add_handler(CommandHandler("recommend", recommend))
-    dispatcher.add_handler(CommandHandler("get", get))
+    # get dispatcher to register handlers
+    dp = updater.dispatcher
 
-    # add up functions
-    dispatcher.add_handler(CommandHandler('ask', ask))
-    dispatcher.add_handler(CommandHandler('reset', reset))
+    dp.add_handler(CommandHandler('start', start))
+    dp.add_handler(CommandHandler('genres', genres))
+    dp.add_handler(CommandHandler('get', get_from_fav))
+    dp.add_handler(CommandHandler('ask', ask_neko_of_movies))
+    dp.add_handler(CallbackQueryHandler(button, pattern=re.compile(r'^(action|comedy|drama|horror)$')))
+    # dp.add_handler(CallbackQueryHandler(director_query, pattern=re.compile(r'^director_(.+)$')))
+    dp.add_handler(CallbackQueryHandler(add_to_fav, pattern=re.compile(r'^fav_(\d+)$')))
+    dp.add_handler(
+        CallbackQueryHandler(movie_button, pattern=re.compile(r'^(?!action|comedy|drama|horror|fav_\d+$).*')))
 
-    # initialize key
-    # start new thread to filter key list every hour
+    # log all errors
+    dp.add_error_handler(error)
+
+    # start finding key
     find_a_working_key()
-    t = threading.Timer(3600.0, find_a_working_key)
+    t = threading.Timer(1200, find_a_working_key)
     t.start()
 
-    dispatcher.add_handler(CallbackQueryHandler(button_callback))
-
-    # Start the bot
+    # start the bot
     updater.start_polling()
 
+    # run the bot until Ctrl-C is pressed
     updater.idle()
 
 if __name__ == '__main__':
