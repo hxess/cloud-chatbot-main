@@ -1,4 +1,4 @@
-import random, requests, openai, threading, logging, os, re, datetime
+import random, requests, openai, threading, logging, os, re, datetime, signal
 import mysql.connector
 
 from mysql.connector import errorcode
@@ -14,19 +14,47 @@ config = {
     'host': os.environ['sqlhost'],
     'database': os.environ['db']
 }
-try:
-    cnx = mysql.connector.connect(**config)
-except mysql.connector.Error as err:
-    if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
-        print("Something is wrong with your user name or password")
-    elif err.errno == errorcode.ER_BAD_DB_ERROR:
-        print("Database does not exist")
-    else:
-        print(err)
-else:
-    print("MySQL connection successful")
-    cursor = cnx.cursor()
+global cnx, cursor
 
+class TimeoutException(Exception):
+    pass
+
+def timer(timeout_event, timeout):
+    timeout_event.wait(timeout)
+    if not timeout_event.is_set():
+        timeout_event.set()
+        raise TimeoutException('Execution timed out')
+
+def mysql_connection():
+    global cnx, cursor
+    try:
+        cnx = mysql.connector.connect(**config)
+    except mysql.connector.Error as err:
+        if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+            logging.info("Something is wrong with your user name or password")
+        elif err.errno == errorcode.ER_BAD_DB_ERROR:
+            logging.info("Database does not exist")
+        else:
+            logging.info(err)
+    else:
+        logging.info("MySQL connection successful")
+        cursor = cnx.cursor(buffered=True)
+
+def pingsql():
+    timeout_event = threading.Event()
+    timeout_thread = threading.Thread(target=timer, args=(timeout_event, 3))
+    try:
+        timeout_thread.start()
+        cursor.execute("SELECT * from User_info_test_1 where 1;")
+        timeout_event.set()
+        logging.info('good connection')
+    except:
+        mysql_connection()
+        logging.info('reconnected')
+    finally:
+        timeout_thread.join()
+        if timeout_event.is_set():
+            logging.info('Execution completed within timeout')
 
 # handle functions
 def error(update, context):
@@ -38,7 +66,7 @@ def start(update, context):
     sql_update_user_info(user_id, user_nickname)
 
     reply_keyboard = [
-        [KeyboardButton('start')],
+        [KeyboardButton('/start')],
         [KeyboardButton('/genres')],
         [KeyboardButton('/get')],
         [KeyboardButton('/ask')],
@@ -109,25 +137,30 @@ def button(update, context):
 def movie_button(update, context):
     query = update.callback_query
     movie_id = query.data
+    logging.info("movie_query: ")
+    try:
+        response = requests.get(f'https://api.themoviedb.org/3/movie/{movie_id}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
 
-    response = requests.get(f'https://api.themoviedb.org/3/movie/{movie_id}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
+        title = response.json()['title']
+        duration = response.json()['runtime']
+        director = response.json()['credits']['crew'][0]['name']
+        cast = [actor['name'] for actor in response.json()['credits']['cast']]
+        poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
 
-    title = response.json()['title']
-    duration = response.json()['runtime']
-    director = response.json()['credits']['crew'][0]['name']
-    cast = [actor['name'] for actor in response.json()['credits']['cast']]
-    poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
+        message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> {', '.join(cast[:10])}"
 
-    message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> {', '.join(cast)}"
 
-    keyboard = [
-                # [InlineKeyboardButton(director, callback_data=f'director_{director}')],
-                [InlineKeyboardButton("Add to favorite", callback_data=f'fav_{movie_id}')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+        keyboard = [
+                    # [InlineKeyboardButton(director, callback_data=f'director_{director}')],
+                    [InlineKeyboardButton("Add to favorite", callback_data=f'fav_{movie_id}')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # send message with movie poster
-    query.message.reply_photo(photo=poster_url, caption=message, parse_mode="HTML", reply_markup=reply_markup)
+        # send message with movie poster
+        query.message.reply_photo(photo=poster_url, caption=message, parse_mode="HTML", reply_markup=reply_markup)
+        logging.info("movie replied")
+    except Exception as e:
+        query.message.reply_text("This movie was not supported by TMDB API")
 
 def director_query(update, context):
     query = update.callback_query
@@ -152,6 +185,7 @@ def director_query(update, context):
 
 ## User profile management
 def sql_update_user_info(user_id, user_nickname):
+    pingsql()
     now = datetime.now()
     timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
     query = "INSERT INTO User_info_test_1 (user_id, user_nickname, user_last_active) " \
@@ -168,12 +202,15 @@ def sql_add_user_fav(user_id, movie_id):
                 "VALUES (%s, %s) " \
                 "ON DUPLICATE KEY UPDATE user_id = user_id"
     values = (user_id, movie_id)
+    pingsql()
     cursor.execute(sql_query, values)
     cnx.commit()
 
 def sql_get_user_fav(user_id):
+    pingsql()
     query = "SELECT movie_id FROM User_favorite_test_1 WHERE user_id = %s ORDER BY RAND() LIMIT 3"
     values = (user_id,)
+    pingsql()
     cursor.execute(query, values)
     result = cursor.fetchall()
     return result
@@ -181,35 +218,38 @@ def sql_get_user_fav(user_id):
 def add_to_fav(update, context):
     query = update.callback_query
     movie_id = query.data.split('_')[1]
-    print(movie_id)
+    logging.info(movie_id)
+
     sql_add_user_fav(update.effective_user.id, movie_id)
     query.message.reply_text("added to favorite successfully")
 
 def get_from_fav(update, context):
     query = update.callback_query
-
+    logging.info("get_from_fav" )
     results = sql_get_user_fav(update.effective_user.id)
 
     if not results:
-        context.bot.send_message(chat_id=update.effective_user.id, text="You haven't favorited any movies yet.")
+        context.bot.send_message(chat_id=update.effective_user.id, text="You haven't favorite any movies yet.")
 
     else:
-        result = random.choice(results)[0]
-        print("bingo" + str(result))
+        try:
+            result = random.choice(results)[0]
+            print("bingo" + str(result))
 
-        # get movie details from API based on selected movie id
-        response = requests.get(
-            f'https://api.themoviedb.org/3/movie/{result}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
+            # get movie details from API based on selected movie id
+            response = requests.get(
+                f'https://api.themoviedb.org/3/movie/{result}?api_key=bfa1c4b7acab32a4eb75aa244f15754f&append_to_response=credits')
 
-        title = response.json()['title']
-        duration = response.json()['runtime']
-        director = response.json()['credits']['crew'][0]['name']
-        cast = [actor['name'] for actor in response.json()['credits']['cast']]
-        poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
+            title = response.json()['title']
+            duration = response.json()['runtime']
+            director = response.json()['credits']['crew'][0]['name']
+            cast = [actor['name'] for actor in response.json()['credits']['cast']]
+            poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
 
-        message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> {', '.join(cast)}"
-        context.bot.send_photo(chat_id=update.effective_user.id, photo=poster_url, caption=message, parse_mode="HTML")
-
+            message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> {', '.join(cast)}"
+            context.bot.send_photo(chat_id=update.effective_user.id, photo=poster_url, caption=message, parse_mode="HTML")
+        except Exception as e:
+            context.bot.send_message(chat_id=update.effective_user.id, test="We got unexpected problem")
 
 ## GPT features
 # local vars for GPT
@@ -220,10 +260,10 @@ def find_a_working_key():
     global good_key
     url = "https://freeopenai.xyz/api.txt"
     response = requests.get(url)
-    lines = response.text.split("\n")
+    lines = response.text.split("\r\n")
 
     for key in lines:
-        openai.api_key = key[:-1]
+        openai.api_key = key
         try:
             # Use the key to make a test request to the API
             response = openai.Completion.create(
@@ -237,14 +277,16 @@ def find_a_working_key():
                 frequency_penalty=0,
                 presence_penalty=0
             )
-            good_key.append(key[:-1])
-            print('find a good key! ' + key[:-1])
+            good_key.append(key)
+            logging.info('find a good key! ' + key)
         except Exception as e:
             continue
 
-    print('done finding keys')
+    logging.info('done finding keys')
+
 def ask_neko_of_movies(update, context):
     query = update.callback_query
+    logging.info("ask_neko_of_movies")
 
     context.bot.send_message(chat_id=update.effective_user.id, text="Working hard to select a movie for you, please wait...")
 
@@ -260,6 +302,7 @@ def ask_neko_of_movies(update, context):
         # context.bot.send_photo(chat_id=update.effective_user.id, photo=poster_url, caption=message, parse_mode="HTML")
         for ele in results:
             ids.append(ele[0])
+
         for id in ids:
             # get movie details from API based on selected movie id
             response = requests.get(
@@ -271,11 +314,11 @@ def ask_neko_of_movies(update, context):
             cast = [actor['name'] for actor in response.json()['credits']['cast']]
             poster_url = f"https://image.tmdb.org/t/p/w500{response.json()['poster_path']}"
 
-            message = f"<b>Title:</b> {title}\n<b>Duration:</b> {duration}\n<b>Director:</b> {director}\n<b>Cast:</b> Overview:</b> {overview} "
+            message = f"<b>Title:</b> {title}\n<b>Director:</b> {director}\n<b>Cast:</b> Overview:</b> {overview} "
             text.append(message)
 
         if len(text) > 10:
-            text = random.sample(text, 10)
+            text = random.sample(text, 5)
 
         prompt = "Please select a movie form the next information I provided, you need to look into the duration and overview of them\n "
         for ele in text:
@@ -306,23 +349,29 @@ def ask_neko_of_movies(update, context):
 
         # if len(good_key) < 1:
         #     context.bot.send_message(chat_id=update.effective_user.id, text='Oops! we encountered a problem with GPT key, maybe try me later.')
-        openai.api_key = good_key[-1]
 
-        # openAi python sdk
-        result = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=user_conversations[user_id]['history']
-        )
 
-        reply = result['choices'][0]['message']['content']
-        user_conversations[user_id]['history'].append({'role': 'assistant', 'content': reply})
-        logging.info("GPT: " + reply)
-        # update.message.reply_text(reply)
-        context.bot.send_message(text=reply, chat_id=update.effective_user.id)
+        try:
+            openai.api_key = good_key[-1]
+            # openAi python sdk
+            result = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=user_conversations[user_id]['history']
+            )
+            reply = result['choices'][0]['message']['content']
+            user_conversations[user_id]['history'].append({'role': 'assistant', 'content': reply})
+            logging.info("GPT: " + reply)
+            # update.message.reply_text(reply)
+            context.bot.send_message(text=reply, chat_id=update.effective_user.id)
+            logging.info("ask_neko_of_movies replied: " + reply)
+        except Exception as e:
+            context.bot.send_message(text="Oops! we got a problem with GPT Api", chat_id=update.effective_user.id)
+            logging.info("ask_neko_of_movies replied: Oops! we got a problem with GPT Api")
+
 
 def main():
-    updater = Updater(os.environ['ACCESS_TOKEN'], use_context=True)
-
+    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+    updater = Updater(token=os.environ['ACCESS_TOKEN'], use_context=True)
     # get dispatcher to register handlers
     dp = updater.dispatcher
 
@@ -337,18 +386,25 @@ def main():
         CallbackQueryHandler(movie_button, pattern=re.compile(r'^(?!action|comedy|drama|horror|fav_\d+$).*')))
 
     # log all errors
-    dp.add_error_handler(error)
+    # dp.add_error_handler(error)
 
     # start finding key
     find_a_working_key()
     t = threading.Timer(1200, find_a_working_key)
     t.start()
 
+    # # sql
+    # s = threading.Timer(600, pingsql)
+    # s.start()
+
+    mysql_connection()
+
     # start the bot
     updater.start_polling()
 
     # run the bot until Ctrl-C is pressed
     updater.idle()
+
 
 if __name__ == '__main__':
     main()
